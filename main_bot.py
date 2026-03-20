@@ -246,6 +246,8 @@ class PromoBot:
         self.logger = Logger(LOGGER_BOT_TOKEN)
         self.tasks = {}
         self.login_states = {}
+        self.pending_message = {}   # Track users waiting to set message
+        self.pending_delay = {}     # Track users waiting to set delay
 
     async def start(self):
         await self.bot.start(bot_token=MAIN_BOT_TOKEN)
@@ -583,17 +585,8 @@ class PromoBot:
             if not self.db.is_premium(user_id):
                 await event.reply("❌ Premium subscription required.")
                 return
+            self.pending_message[user_id] = True
             await event.reply("💬 Please send the promotional message you want to broadcast:")
-
-            @self.bot.on(events.NewMessage(from_users=user_id))
-            async def message_handler(msg_event):
-                if msg_event.message.text.startswith('/'):
-                    self.bot.remove_event_handler(message_handler)
-                    return
-                self.bot.remove_event_handler(message_handler)
-                message = msg_event.message.text
-                self.db.set_promo_message(user_id, message)
-                await msg_event.reply("✅ Promotional message saved!\n\nUse /startcampaign to begin.")
 
         @self.bot.on(events.NewMessage(pattern='/setdelay'))
         async def setdelay(event):
@@ -601,6 +594,7 @@ class PromoBot:
             if not self.db.is_premium(user_id):
                 await event.reply("❌ Premium subscription required.")
                 return
+            self.pending_delay[user_id] = True
             await event.reply(
                 "⏱️ **Set Delays:**\n\n"
                 "Send in format: `MESSAGE_DELAY CYCLE_DELAY`\n\n"
@@ -609,32 +603,6 @@ class PromoBot:
                 "Example: `45 5`",
                 parse_mode='md'
             )
-
-            @self.bot.on(events.NewMessage(from_users=user_id))
-            async def delay_handler(delay_event):
-                if delay_event.message.text.startswith('/'):
-                    self.bot.remove_event_handler(delay_handler)
-                    return
-                self.bot.remove_event_handler(delay_handler)
-                try:
-                    parts = delay_event.message.text.split()
-                    msg_delay = int(parts[0])
-                    cycle_delay = int(parts[1])
-                    if msg_delay not in [30, 45, 60]:
-                        await delay_event.reply("❌ Message delay must be 30, 45, or 60 seconds")
-                        return
-                    if cycle_delay not in [2, 5, 10]:
-                        await delay_event.reply("❌ Cycle delay must be 2, 5, or 10 minutes")
-                        return
-                    self.db.set_delay(user_id, msg_delay)
-                    self.db.set_cycle_delay(user_id, cycle_delay * 60)
-                    await delay_event.reply(
-                        f"✅ Delays set!\n\n"
-                        f"Message Delay: {msg_delay}s\n"
-                        f"Cycle Delay: {cycle_delay}m"
-                    )
-                except (ValueError, IndexError):
-                    await delay_event.reply("❌ Invalid format. Use: MESSAGE_DELAY CYCLE_DELAY\n\nExample: 45 5")
 
         @self.bot.on(events.NewMessage(pattern='/startcampaign'))
         async def startcampaign(event):
@@ -672,6 +640,45 @@ class PromoBot:
             del self.tasks[user_id]
             await event.reply("🛑 Campaign stopped!")
             self.logger.send_log(user_id, "🛑 Campaign stopped")
+
+        # Global handler to catch setmessage and setdelay responses
+        @self.bot.on(events.NewMessage())
+        async def global_handler(event):
+            user_id = event.sender_id
+            text = event.message.text
+            if not text or text.startswith('/'):
+                return
+
+            # Handle pending setmessage
+            if user_id in self.pending_message:
+                del self.pending_message[user_id]
+                self.db.set_promo_message(user_id, text)
+                await event.reply("✅ Promotional message saved!\n\nUse /startcampaign to begin.")
+                return
+
+            # Handle pending setdelay
+            if user_id in self.pending_delay:
+                del self.pending_delay[user_id]
+                try:
+                    parts = text.split()
+                    msg_delay = int(parts[0])
+                    cycle_delay = int(parts[1])
+                    if msg_delay not in [30, 45, 60]:
+                        await event.reply("❌ Message delay must be 30, 45, or 60 seconds")
+                        return
+                    if cycle_delay not in [2, 5, 10]:
+                        await event.reply("❌ Cycle delay must be 2, 5, or 10 minutes")
+                        return
+                    self.db.set_delay(user_id, msg_delay)
+                    self.db.set_cycle_delay(user_id, cycle_delay * 60)
+                    await event.reply(
+                        f"✅ Delays set!\n\n"
+                        f"Message Delay: {msg_delay}s\n"
+                        f"Cycle Delay: {cycle_delay}m"
+                    )
+                except (ValueError, IndexError):
+                    await event.reply("❌ Invalid format. Use: MESSAGE_DELAY CYCLE_DELAY\n\nExample: 45 5")
+                return
 
         # FIX: user_id was undefined in original code
         @self.bot.on(events.NewMessage(pattern='/status'))
