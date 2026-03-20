@@ -3,6 +3,7 @@ import os
 import sys
 import asyncio
 import sqlite3
+import json
 from datetime import datetime, timedelta
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -10,69 +11,88 @@ from telethon.errors import FloodWaitError, SessionPasswordNeededError
 import requests
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
-# Bot API credentials
 BOT_API_ID = int(os.getenv('API_ID'))
 BOT_API_HASH = os.getenv('API_HASH')
 MAIN_BOT_TOKEN = os.getenv('MAIN_BOT_TOKEN')
 LOGGER_BOT_TOKEN = os.getenv('LOGGER_BOT_TOKEN')
-
-# Admin user IDs
 ADMINS = [int(x.strip()) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip()]
 
 # ============================================
-# DATABASE CLASS
+# KEYBOARD HELPERS
+# ============================================
+def make_keyboard(buttons):
+    return {"inline_keyboard": buttons}
+
+def dashboard_keyboard():
+    return make_keyboard([
+        [{"text": "👤 My Account", "callback_data": "account"},
+         {"text": "📊 Status", "callback_data": "status"}],
+        [{"text": "💬 Set Message", "callback_data": "setmessage"},
+         {"text": "⏱️ Set Delay", "callback_data": "setdelay"}],
+        [{"text": "🚀 Start Campaign", "callback_data": "startcampaign"},
+         {"text": "🛑 Stop Campaign", "callback_data": "stopcampaign"}],
+        [{"text": "🔑 Login", "callback_data": "login"},
+         {"text": "💎 Premium", "callback_data": "premium"}],
+        [{"text": "🚪 Logout", "callback_data": "logout"}]
+    ])
+
+def back_keyboard():
+    return make_keyboard([[{"text": "🏠 Dashboard", "callback_data": "dashboard"}]])
+
+def bot_api(method, data):
+    url = f"https://api.telegram.org/bot{MAIN_BOT_TOKEN}/{method}"
+    try:
+        requests.post(url, data={k: json.dumps(v) if isinstance(v, dict) else v for k, v in data.items()}, timeout=10)
+    except Exception as e:
+        print(f"Bot API error: {e}")
+
+def send_msg(chat_id, text, keyboard=None):
+    data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if keyboard:
+        data["reply_markup"] = json.dumps(keyboard)
+    bot_api("sendMessage", data)
+
+def edit_msg(chat_id, msg_id, text, keyboard=None):
+    data = {"chat_id": chat_id, "message_id": msg_id, "text": text, "parse_mode": "Markdown"}
+    if keyboard:
+        data["reply_markup"] = json.dumps(keyboard)
+    bot_api("editMessageText", data)
+
+# ============================================
+# DATABASE
 # ============================================
 class Database:
     def __init__(self, db_name='premium_bot.db'):
         self.db_name = db_name
         self.init_db()
 
-    def get_connection(self):
+    def get_conn(self):
         conn = sqlite3.connect(self.db_name, timeout=30.0, check_same_thread=False)
         conn.execute('PRAGMA journal_mode=WAL')
         return conn
 
     def init_db(self):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                phone TEXT,
-                api_id INTEGER,
-                api_hash TEXT,
-                session_string TEXT,
-                promo_message TEXT,
-                is_active INTEGER DEFAULT 0,
-                subscription_expiry TEXT,
-                delay INTEGER DEFAULT 30,
-                cycle_delay INTEGER DEFAULT 120
-            )
-        ''')
-
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS redeem_codes (
-                code TEXT PRIMARY KEY,
-                days INTEGER,
-                used INTEGER DEFAULT 0,
-                used_by INTEGER,
-                used_at TEXT
-            )
-        ''')
-
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY, username TEXT, phone TEXT,
+            api_id INTEGER, api_hash TEXT, session_string TEXT,
+            promo_message TEXT, is_active INTEGER DEFAULT 0,
+            subscription_expiry TEXT, delay INTEGER DEFAULT 30,
+            cycle_delay INTEGER DEFAULT 120)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS redeem_codes (
+            code TEXT PRIMARY KEY, days INTEGER, used INTEGER DEFAULT 0,
+            used_by INTEGER, used_at TEXT)''')
         conn.commit()
         conn.close()
 
     def add_code(self, code, days):
-        conn = self.get_connection()
-        cursor = conn.cursor()
+        conn = self.get_conn()
+        c = conn.cursor()
         try:
-            cursor.execute('INSERT INTO redeem_codes (code, days) VALUES (?, ?)', (code, days))
+            c.execute('INSERT INTO redeem_codes (code, days) VALUES (?, ?)', (code, days))
             conn.commit()
             conn.close()
             return True
@@ -81,163 +101,143 @@ class Database:
             return False
 
     def get_unused_codes(self):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT code, days FROM redeem_codes WHERE used = 0')
-        result = cursor.fetchall()
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute('SELECT code, days FROM redeem_codes WHERE used = 0')
+        r = c.fetchall()
         conn.close()
-        return result
+        return r
 
     def redeem_code(self, code, user_id, username):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT days, used FROM redeem_codes WHERE code = ?', (code,))
-        result = cursor.fetchone()
-
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute('SELECT days, used FROM redeem_codes WHERE code = ?', (code,))
+        result = c.fetchone()
         if not result:
             conn.close()
             return False, "Invalid code"
-
         days, used = result
         if used:
             conn.close()
             return False, "Code already used"
-
-        expiry = datetime.now() + timedelta(days=days)
-        expiry_str = expiry.strftime('%Y-%m-%d %H:%M:%S')
-
-        cursor.execute('UPDATE redeem_codes SET used = 1, used_by = ?, used_at = ? WHERE code = ?',
-                      (user_id, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), code))
-
-        cursor.execute('SELECT user_id FROM users WHERE user_id = ?', (user_id,))
-        if cursor.fetchone():
-            cursor.execute('UPDATE users SET subscription_expiry = ?, username = ? WHERE user_id = ?',
-                          (expiry_str, username, user_id))
+        expiry = (datetime.now() + timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+        c.execute('UPDATE redeem_codes SET used=1, used_by=?, used_at=? WHERE code=?',
+                  (user_id, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), code))
+        c.execute('SELECT user_id FROM users WHERE user_id=?', (user_id,))
+        if c.fetchone():
+            c.execute('UPDATE users SET subscription_expiry=?, username=? WHERE user_id=?', (expiry, username, user_id))
         else:
-            cursor.execute('INSERT INTO users (user_id, username, subscription_expiry) VALUES (?, ?, ?)',
-                          (user_id, username, expiry_str))
-
+            c.execute('INSERT INTO users (user_id, username, subscription_expiry) VALUES (?,?,?)', (user_id, username, expiry))
         conn.commit()
         conn.close()
         return True, days
 
     def is_premium(self, user_id):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT subscription_expiry FROM users WHERE user_id = ?', (user_id,))
-        result = cursor.fetchone()
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute('SELECT subscription_expiry FROM users WHERE user_id=?', (user_id,))
+        r = c.fetchone()
         conn.close()
-
-        if not result or not result[0]:
+        if not r or not r[0]:
             return False
-
-        expiry = datetime.strptime(result[0], '%Y-%m-%d %H:%M:%S')
-        return datetime.now() < expiry
+        return datetime.now() < datetime.strptime(r[0], '%Y-%m-%d %H:%M:%S')
 
     def get_premium_users(self):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT user_id, username, subscription_expiry FROM users WHERE subscription_expiry IS NOT NULL')
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute('SELECT user_id, username, subscription_expiry FROM users WHERE subscription_expiry IS NOT NULL')
         users = []
-        for row in cursor.fetchall():
+        for row in c.fetchall():
             try:
-                expiry = datetime.strptime(row[2], '%Y-%m-%d %H:%M:%S')
-                if datetime.now() < expiry:
+                if datetime.now() < datetime.strptime(row[2], '%Y-%m-%d %H:%M:%S'):
                     users.append(row)
-            except:
-                pass
+            except: pass
         conn.close()
         return users
 
     def revoke_premium(self, user_id):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('UPDATE users SET subscription_expiry = NULL WHERE user_id = ?', (user_id,))
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute('UPDATE users SET subscription_expiry=NULL WHERE user_id=?', (user_id,))
         conn.commit()
         conn.close()
 
     def save_session(self, user_id, phone, api_id, api_hash, session_string):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('UPDATE users SET phone = ?, api_id = ?, api_hash = ?, session_string = ? WHERE user_id = ?',
-                      (phone, api_id, api_hash, session_string, user_id))
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute('UPDATE users SET phone=?, api_id=?, api_hash=?, session_string=? WHERE user_id=?',
+                  (phone, api_id, api_hash, session_string, user_id))
         conn.commit()
         conn.close()
 
     def get_user(self, user_id):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('''SELECT user_id, phone, api_id, api_hash, session_string,
-                         promo_message, is_active, delay, cycle_delay
-                         FROM users WHERE user_id = ?''', (user_id,))
-        result = cursor.fetchone()
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute('SELECT user_id, phone, api_id, api_hash, session_string, promo_message, is_active, delay, cycle_delay FROM users WHERE user_id=?', (user_id,))
+        r = c.fetchone()
         conn.close()
-        return result
+        return r
 
     def set_promo_message(self, user_id, message):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('UPDATE users SET promo_message = ? WHERE user_id = ?', (message, user_id))
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute('UPDATE users SET promo_message=? WHERE user_id=?', (message, user_id))
         conn.commit()
         conn.close()
 
     def set_campaign_status(self, user_id, status):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('UPDATE users SET is_active = ? WHERE user_id = ?', (status, user_id))
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute('UPDATE users SET is_active=? WHERE user_id=?', (status, user_id))
         conn.commit()
         conn.close()
 
     def set_delay(self, user_id, delay):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('UPDATE users SET delay = ? WHERE user_id = ?', (delay, user_id))
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute('UPDATE users SET delay=? WHERE user_id=?', (delay, user_id))
         conn.commit()
         conn.close()
 
     def set_cycle_delay(self, user_id, cycle_delay):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('UPDATE users SET cycle_delay = ? WHERE user_id = ?', (cycle_delay, user_id))
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute('UPDATE users SET cycle_delay=? WHERE user_id=?', (cycle_delay, user_id))
         conn.commit()
         conn.close()
 
     def get_days_remaining(self, user_id):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT subscription_expiry FROM users WHERE user_id = ?', (user_id,))
-        result = cursor.fetchone()
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute('SELECT subscription_expiry FROM users WHERE user_id=?', (user_id,))
+        r = c.fetchone()
+        conn.close()
+        if not r or not r[0]:
+            return 0
+        return max(0, (datetime.strptime(r[0], '%Y-%m-%d %H:%M:%S') - datetime.now()).days)
+
+    def logout_user(self, user_id):
+        conn = self.get_conn()
+        c = conn.cursor()
+        c.execute('UPDATE users SET phone=NULL, api_id=NULL, api_hash=NULL, session_string=NULL, is_active=0 WHERE user_id=?', (user_id,))
+        conn.commit()
         conn.close()
 
-        if not result or not result[0]:
-            return 0
-
-        expiry = datetime.strptime(result[0], '%Y-%m-%d %H:%M:%S')
-        remaining = expiry - datetime.now()
-        return max(0, remaining.days)
-
 # ============================================
-# LOGGER CLASS
+# LOGGER
 # ============================================
 class Logger:
-    def __init__(self, bot_token):
-        self.bot_token = bot_token
-        self.base_url = f"https://api.telegram.org/bot{bot_token}"
+    def __init__(self, token):
+        self.url = f"https://api.telegram.org/bot{token}/sendMessage"
 
     def send_log(self, chat_id, message):
         try:
-            url = f"{self.base_url}/sendMessage"
-            data = {
-                'chat_id': chat_id,
-                'text': message,
-                'parse_mode': 'HTML'
-            }
-            requests.post(url, data=data, timeout=10)
+            requests.post(self.url, data={'chat_id': chat_id, 'text': message, 'parse_mode': 'HTML'}, timeout=10)
         except Exception as e:
             print(f"Logger error: {e}")
 
 # ============================================
-# PROMO BOT CLASS
+# MAIN BOT
 # ============================================
 class PromoBot:
     def __init__(self):
@@ -246,8 +246,27 @@ class PromoBot:
         self.logger = Logger(LOGGER_BOT_TOKEN)
         self.tasks = {}
         self.login_states = {}
-        self.pending_message = {}   # Track users waiting to set message
-        self.pending_delay = {}     # Track users waiting to set delay
+        self.pending_message = {}
+        self.pending_delay = {}
+
+    def dashboard_text(self, user_id):
+        user = self.db.get_user(user_id)
+        days = self.db.get_days_remaining(user_id)
+        phone = user[1] if user and user[1] else "Not connected"
+        msg_status = "✅ Set" if user and user[5] else "❌ Not set"
+        campaign = "🟢 Running" if user and user[6] else "🔴 Stopped"
+        delay = f"{user[7]}s" if user and user[7] else "30s"
+        cycle = f"{user[8]//60}m" if user and user[8] else "2m"
+        return (
+            f"🤖 *Premium Promo Bot*\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"📱 Account: `{phone}`\n"
+            f"💬 Ad Message: {msg_status}\n"
+            f"⏱️ Delay: {delay}  |  Cycle: {cycle}\n"
+            f"📡 Campaign: {campaign}\n"
+            f"💎 Premium: {days} days left\n"
+            f"━━━━━━━━━━━━━━━━"
+        )
 
     async def start(self):
         await self.bot.start(bot_token=MAIN_BOT_TOKEN)
@@ -258,407 +277,261 @@ class PromoBot:
 
     def register_handlers(self):
 
-        # ==================== ADMIN COMMANDS ====================
+        # ── ADMIN COMMANDS ──────────────────────────
 
         @self.bot.on(events.NewMessage(pattern='/addcode'))
         async def addcode(event):
-            if event.sender_id not in ADMINS:
-                return
+            if event.sender_id not in ADMINS: return
             try:
-                parts = event.message.text.split()
-                if len(parts) != 3:
-                    await event.reply("❌ Usage: /addcode <CODE> <DAYS>")
-                    return
-                code = parts[1]
-                days = int(parts[2])
-                if self.db.add_code(code, days):
-                    await event.reply(f"✅ Code added!\n\nCode: `{code}`\nDuration: {days} days", parse_mode='md')
+                _, code, days = event.message.text.split()
+                if self.db.add_code(code, int(days)):
+                    await event.reply(f"✅ Code `{code}` added for {days} days", parse_mode='md')
                 else:
                     await event.reply("❌ Code already exists")
-            except ValueError:
-                await event.reply("❌ Days must be a number")
-            except Exception as e:
-                await event.reply(f"❌ Error: {e}")
+            except:
+                await event.reply("❌ Usage: /addcode CODE DAYS")
 
         @self.bot.on(events.NewMessage(pattern='/codes'))
         async def codes(event):
-            if event.sender_id not in ADMINS:
-                return
+            if event.sender_id not in ADMINS: return
             codes_list = self.db.get_unused_codes()
             if not codes_list:
-                await event.reply("📋 No unused codes available")
+                await event.reply("📋 No unused codes")
                 return
-            msg = "📋 **Unused Codes:**\n\n"
-            for code, days in codes_list:
-                msg += f"• `{code}` - {days} days\n"
+            msg = "📋 *Unused Codes:*\n\n" + "\n".join([f"• `{c}` — {d} days" for c, d in codes_list])
             await event.reply(msg, parse_mode='md')
 
         @self.bot.on(events.NewMessage(pattern='/users'))
         async def users(event):
-            if event.sender_id not in ADMINS:
-                return
+            if event.sender_id not in ADMINS: return
             users_list = self.db.get_premium_users()
             if not users_list:
                 await event.reply("👥 No active premium users")
                 return
-            msg = "👥 **Active Premium Users:**\n\n"
-            for user_id, username, expiry in users_list:
-                expiry_date = datetime.strptime(expiry, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d')
-                username_str = f"@{username}" if username else f"ID: {user_id}"
-                msg += f"• {username_str}\n  Expires: {expiry_date}\n\n"
+            msg = "👥 *Premium Users:*\n\n"
+            for uid, uname, expiry in users_list:
+                exp = datetime.strptime(expiry, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d')
+                msg += f"• {'@'+uname if uname else 'ID:'+str(uid)} — {exp}\n"
             await event.reply(msg, parse_mode='md')
 
         @self.bot.on(events.NewMessage(pattern='/revoke'))
         async def revoke(event):
-            if event.sender_id not in ADMINS:
-                return
+            if event.sender_id not in ADMINS: return
             try:
-                parts = event.message.text.split()
-                if len(parts) != 2:
-                    await event.reply("❌ Usage: /revoke <user_id>")
-                    return
-                user_id = int(parts[1])
-                self.db.revoke_premium(user_id)
-                if user_id in self.tasks:
-                    self.tasks[user_id].cancel()
-                    del self.tasks[user_id]
-                await event.reply(f"✅ Premium revoked for user {user_id}")
-                try:
-                    await self.bot.send_message(user_id, "⚠️ Your premium subscription has been revoked by admin.")
-                except:
-                    pass
-            except ValueError:
-                await event.reply("❌ Invalid user ID")
-            except Exception as e:
-                await event.reply(f"❌ Error: {e}")
+                uid = int(event.message.text.split()[1])
+                self.db.revoke_premium(uid)
+                if uid in self.tasks:
+                    self.tasks[uid].cancel()
+                    del self.tasks[uid]
+                await event.reply(f"✅ Premium revoked for {uid}")
+                try: await self.bot.send_message(uid, "⚠️ Your premium has been revoked.")
+                except: pass
+            except:
+                await event.reply("❌ Usage: /revoke USER_ID")
 
-        # ==================== USER COMMANDS ====================
+        # ── USER COMMANDS ────────────────────────────
 
         @self.bot.on(events.NewMessage(pattern='/start'))
         async def start(event):
-            user_id = event.sender_id
-            if not self.db.is_premium(user_id):
-                await event.reply(
-                    "🔒 **Subscription Not Active**\n\n"
-                    "This is a premium bot. Contact the owner to get a redeem code.\n\n"
-                    "Use /redeem <CODE> to activate your subscription."
+            uid = event.sender_id
+            if not self.db.is_premium(uid):
+                send_msg(uid,
+                    "🔒 *Subscription Required*\n\n"
+                    "Contact the owner for a redeem code.\n"
+                    "Then use: `/redeem YOUR_CODE`",
+                    make_keyboard([[{"text": "🎟️ I have a code — /redeem CODE", "callback_data": "redeem_hint"}]])
                 )
                 return
-            await event.reply(
-                "✅ **Welcome to Premium Promo Bot!**\n\n"
-                "Available Commands:\n"
-                "/login - Login with your Telegram account\n"
-                "/setmessage - Set promotional message\n"
-                "/setdelay - Set delay between messages\n"
-                "/startcampaign - Start sending campaign\n"
-                "/stopcampaign - Stop campaign\n"
-                "/status - Check campaign status\n"
-                "/premium - Check subscription status"
-            )
+            send_msg(uid, self.dashboard_text(uid), dashboard_keyboard())
 
         @self.bot.on(events.NewMessage(pattern='/redeem'))
         async def redeem(event):
-            user_id = event.sender_id
+            uid = event.sender_id
             username = event.sender.username
             try:
-                parts = event.message.text.split()
-                if len(parts) != 2:
-                    await event.reply("❌ Usage: /redeem <CODE>")
-                    return
-                code = parts[1]
-                success, result = self.db.redeem_code(code, user_id, username)
+                code = event.message.text.split()[1]
+                success, result = self.db.redeem_code(code, uid, username)
                 if success:
-                    await event.reply(
-                        f"🎉 **Subscription Activated!**\n\n"
-                        f"Duration: {result} days\n\n"
-                        f"Use /start to see available commands."
+                    send_msg(uid,
+                        f"🎉 *Subscription Activated!*\n\n💎 Duration: {result} days",
+                        make_keyboard([[{"text": "🏠 Open Dashboard", "callback_data": "dashboard"}]])
                     )
                 else:
                     await event.reply(f"❌ {result}")
+            except IndexError:
+                await event.reply("❌ Usage: /redeem CODE")
             except Exception as e:
                 await event.reply(f"❌ Error: {e}")
 
-        @self.bot.on(events.NewMessage(pattern='/premium'))
-        async def premium(event):
-            user_id = event.sender_id
-            if not self.db.is_premium(user_id):
-                await event.reply("❌ You don't have an active subscription.")
-                return
-            days = self.db.get_days_remaining(user_id)
-            await event.reply(f"✅ **Premium Active**\n\n🗓️ Days remaining: {days}")
+        # ── CALLBACK BUTTONS ─────────────────────────
 
-        @self.bot.on(events.NewMessage(pattern='/login'))
-        async def login(event):
-            user_id = event.sender_id
-            if not self.db.is_premium(user_id):
-                await event.reply("❌ Premium subscription required. Use /redeem <CODE>")
+        @self.bot.on(events.CallbackQuery())
+        async def callbacks(event):
+            uid = event.sender_id
+            data = event.data.decode('utf-8')
+            await event.answer()
+
+            if data == 'redeem_hint':
+                await self.bot.send_message(uid, "Send your code like this:\n`/redeem YOUR_CODE`", parse_mode='md')
                 return
 
-            # FIX: Check if already logged in
-            user = self.db.get_user(user_id)
-            if user and user[4]:  # session_string exists
-                await event.reply("✅ You're already logged in!\n\nUse /status to check your campaign.")
+            if not self.db.is_premium(uid):
+                await event.answer("❌ Premium required!", alert=True)
                 return
 
-            await event.reply(
-                "🔑 **Login to Your Telegram Account**\n\n"
-                "First, you need your API credentials from Telegram:\n\n"
-                "1. Visit: https://my.telegram.org/apps\n"
-                "2. Login with your phone number\n"
-                "3. Create an app (if you haven't)\n"
-                "4. Copy your API_ID and API_HASH\n\n"
-                "📝 Send them in this format:\n"
-                "`API_ID API_HASH`\n\n"
-                "Example: `12345678 abcdef1234567890abcdef12`\n\n"
-                "Send /cancel to cancel"
-            )
-            self.login_states[user_id] = {'step': 'waiting_api'}
+            mid = event.query.msg_id
 
-            @self.bot.on(events.NewMessage(from_users=user_id))
-            async def api_handler(api_event):
-                if user_id not in self.login_states:
-                    self.bot.remove_event_handler(api_handler)
+            if data == 'dashboard':
+                edit_msg(uid, mid, self.dashboard_text(uid), dashboard_keyboard())
+
+            elif data == 'premium':
+                days = self.db.get_days_remaining(uid)
+                edit_msg(uid, mid,
+                    f"💎 *Premium Status*\n\n✅ Active\n🗓️ Days remaining: *{days}*",
+                    back_keyboard())
+
+            elif data == 'account':
+                user = self.db.get_user(uid)
+                phone = user[1] if user and user[1] else "Not connected"
+                connected = "✅ Connected" if user and user[4] else "❌ Not connected"
+                edit_msg(uid, mid,
+                    f"👤 *My Account*\n\n📱 Phone: `{phone}`\n🔗 Status: {connected}",
+                    make_keyboard([
+                        [{"text": "🔑 Login", "callback_data": "login"},
+                         {"text": "🚪 Logout", "callback_data": "logout"}],
+                        [{"text": "🏠 Dashboard", "callback_data": "dashboard"}]
+                    ]))
+
+            elif data == 'status':
+                user = self.db.get_user(uid)
+                if not user:
+                    await event.answer("❌ Login first!", alert=True)
                     return
-                if self.login_states[user_id].get('step') != 'waiting_api':
+                s = "🟢 Running" if user[6] else "🔴 Stopped"
+                msg_preview = (user[5][:50]+'...') if user[5] and len(user[5]) > 50 else (user[5] or "Not set")
+                edit_msg(uid, mid,
+                    f"📊 *Campaign Status*\n\n"
+                    f"📱 Phone: `{user[1] or 'Not set'}`\n"
+                    f"💬 Message: {msg_preview}\n"
+                    f"📡 Status: {s}\n"
+                    f"⏱️ Delay: {user[7]}s  |  Cycle: {user[8]//60}m",
+                    back_keyboard())
+
+            elif data == 'setmessage':
+                self.pending_message[uid] = True
+                if uid in self.pending_delay: del self.pending_delay[uid]
+                edit_msg(uid, mid,
+                    "💬 *Set Promotional Message*\n\nSend your promo message now:\n\n_Type /cancel to go back_",
+                    make_keyboard([[{"text": "❌ Cancel", "callback_data": "dashboard"}]]))
+
+            elif data == 'setdelay':
+                self.pending_delay[uid] = True
+                if uid in self.pending_message: del self.pending_message[uid]
+                edit_msg(uid, mid,
+                    "⏱️ *Set Delays*\n\n"
+                    "Format: `MSG_DELAY CYCLE_DELAY`\n\n"
+                    "• Message delay (sec): `30`, `45`, `60`\n"
+                    "• Cycle delay (min): `2`, `5`, `10`\n\n"
+                    "Example: `45 5`\n\n_Type /cancel to go back_",
+                    make_keyboard([[{"text": "❌ Cancel", "callback_data": "dashboard"}]]))
+
+            elif data == 'startcampaign':
+                user = self.db.get_user(uid)
+                if not user or not user[4]:
+                    await event.answer("❌ Login first!", alert=True)
                     return
-                if api_event.message.text.startswith('/cancel'):
-                    self.bot.remove_event_handler(api_handler)
-                    del self.login_states[user_id]
-                    await api_event.reply("❌ Login cancelled")
+                if not user[5]:
+                    await event.answer("❌ Set message first!", alert=True)
                     return
-                if api_event.message.text.startswith('/'):
+                if uid in self.tasks:
+                    await event.answer("⚠️ Already running!", alert=True)
                     return
+                self.db.set_campaign_status(uid, 1)
+                task = asyncio.create_task(self.run_campaign(uid))
+                self.tasks[uid] = task
+                self.logger.send_log(uid, "🚀 Campaign started")
+                edit_msg(uid, mid, self.dashboard_text(uid), dashboard_keyboard())
+                await self.bot.send_message(uid, "🚀 *Campaign Started!*", parse_mode='md')
 
-                self.bot.remove_event_handler(api_handler)
+            elif data == 'stopcampaign':
+                if uid not in self.tasks:
+                    await event.answer("⚠️ Not running!", alert=True)
+                    return
+                self.db.set_campaign_status(uid, 0)
+                self.tasks[uid].cancel()
+                del self.tasks[uid]
+                self.logger.send_log(uid, "🛑 Campaign stopped")
+                edit_msg(uid, mid, self.dashboard_text(uid), dashboard_keyboard())
+                await self.bot.send_message(uid, "🛑 *Campaign Stopped!*", parse_mode='md')
 
-                try:
-                    parts = api_event.message.text.strip().split()
-                    if len(parts) != 2:
-                        await api_event.reply("❌ Invalid format. Please send: `API_ID API_HASH`\n\nUse /login to try again")
-                        del self.login_states[user_id]
-                        return
+            elif data == 'login':
+                user = self.db.get_user(uid)
+                if user and user[4]:
+                    await event.answer("✅ Already logged in!", alert=True)
+                    return
+                self.login_states[uid] = {'step': 'waiting_api'}
+                edit_msg(uid, mid,
+                    "🔑 *Login to Your Telegram Account*\n\n"
+                    "1. Go to https://my.telegram.org/apps\n"
+                    "2. Create an app\n"
+                    "3. Copy API\\_ID and API\\_HASH\n\n"
+                    "Send in this format:\n`API_ID API_HASH`\n\n"
+                    "Example: `12345678 abcdef1234567890`",
+                    make_keyboard([[{"text": "❌ Cancel", "callback_data": "cancel_login"}]]))
 
-                    api_id = int(parts[0])
-                    api_hash = parts[1]
+            elif data == 'cancel_login':
+                if uid in self.login_states:
+                    try:
+                        c = self.login_states[uid].get('client')
+                        if c: await c.disconnect()
+                    except: pass
+                    del self.login_states[uid]
+                edit_msg(uid, mid, self.dashboard_text(uid), dashboard_keyboard())
 
-                    self.login_states[user_id]['api_id'] = api_id
-                    self.login_states[user_id]['api_hash'] = api_hash
-                    self.login_states[user_id]['step'] = 'waiting_phone'
+            elif data == 'logout':
+                if uid in self.tasks:
+                    self.tasks[uid].cancel()
+                    del self.tasks[uid]
+                self.db.logout_user(uid)
+                edit_msg(uid, mid, self.dashboard_text(uid), dashboard_keyboard())
+                await self.bot.send_message(uid, "✅ Logged out successfully!")
 
-                    await api_event.reply("✅ API credentials received!\n\n📱 Now send your phone number (with country code)\n\nExample: `+911234567890`\n\nSend /cancel to cancel")
+        # ── GLOBAL MESSAGE HANDLER ───────────────────
 
-                    @self.bot.on(events.NewMessage(from_users=user_id))
-                    async def phone_handler(phone_event):
-                        if user_id not in self.login_states:
-                            self.bot.remove_event_handler(phone_handler)
-                            return
-                        if self.login_states[user_id].get('step') != 'waiting_phone':
-                            return
-                        if phone_event.message.text.startswith('/cancel'):
-                            self.bot.remove_event_handler(phone_handler)
-                            del self.login_states[user_id]
-                            await phone_event.reply("❌ Login cancelled")
-                            return
-                        if not phone_event.message.text.startswith('+'):
-                            await phone_event.reply("❌ Phone must start with + and country code\nExample: +911234567890")
-                            return
-
-                        self.bot.remove_event_handler(phone_handler)
-                        phone = phone_event.message.text.strip()
-                        api_id = self.login_states[user_id]['api_id']
-                        api_hash = self.login_states[user_id]['api_hash']
-
-                        try:
-                            user_client = TelegramClient(StringSession(), api_id, api_hash)
-                            await user_client.connect()
-                            await user_client.send_code_request(phone)
-
-                            self.login_states[user_id]['client'] = user_client
-                            self.login_states[user_id]['phone'] = phone
-                            self.login_states[user_id]['step'] = 'waiting_code'
-
-                            await phone_event.reply("📨 Code sent! Please enter the verification code:\n\nSend /cancel to cancel")
-
-                            @self.bot.on(events.NewMessage(from_users=user_id))
-                            async def code_handler(code_event):
-                                if user_id not in self.login_states:
-                                    self.bot.remove_event_handler(code_handler)
-                                    return
-                                if self.login_states[user_id].get('step') != 'waiting_code':
-                                    return
-                                if code_event.message.text.startswith('/cancel'):
-                                    self.bot.remove_event_handler(code_handler)
-                                    try:
-                                        await self.login_states[user_id]['client'].disconnect()
-                                    except:
-                                        pass
-                                    del self.login_states[user_id]
-                                    await code_event.reply("❌ Login cancelled")
-                                    return
-                                if not code_event.message.text.replace('-', '').replace(' ', '').isdigit():
-                                    await code_event.reply("❌ Please enter only the numeric code")
-                                    return
-
-                                self.bot.remove_event_handler(code_handler)
-                                code = code_event.message.text.strip()
-                                user_client = self.login_states[user_id]['client']
-                                phone = self.login_states[user_id]['phone']
-                                api_id = self.login_states[user_id]['api_id']
-                                api_hash = self.login_states[user_id]['api_hash']
-
-                                try:
-                                    await user_client.sign_in(phone, code)
-                                except SessionPasswordNeededError:
-                                    self.login_states[user_id]['step'] = 'waiting_password'
-                                    await code_event.reply("🔐 2FA enabled. Please send your password:\n\nSend /cancel to cancel")
-
-                                    @self.bot.on(events.NewMessage(from_users=user_id))
-                                    async def password_handler(pwd_event):
-                                        if user_id not in self.login_states:
-                                            self.bot.remove_event_handler(password_handler)
-                                            return
-                                        if self.login_states[user_id].get('step') != 'waiting_password':
-                                            return
-                                        if pwd_event.message.text.startswith('/cancel'):
-                                            self.bot.remove_event_handler(password_handler)
-                                            try:
-                                                await self.login_states[user_id]['client'].disconnect()
-                                            except:
-                                                pass
-                                            del self.login_states[user_id]
-                                            await pwd_event.reply("❌ Login cancelled")
-                                            return
-                                        if pwd_event.message.text.startswith('/'):
-                                            return
-
-                                        self.bot.remove_event_handler(password_handler)
-                                        password = pwd_event.message.text.strip()
-                                        user_client = self.login_states[user_id]['client']
-                                        phone = self.login_states[user_id]['phone']
-                                        api_id = self.login_states[user_id]['api_id']
-                                        api_hash = self.login_states[user_id]['api_hash']
-
-                                        try:
-                                            await user_client.sign_in(password=password)
-                                            session_string = user_client.session.save()
-                                            self.db.save_session(user_id, phone, api_id, api_hash, session_string)
-                                            await pwd_event.reply("✅ Login successful! Use /start to continue.")
-                                            await user_client.disconnect()
-                                            del self.login_states[user_id]
-                                            self.logger.send_log(user_id, f"✅ Account added: {phone}")
-                                        except Exception as e:
-                                            await pwd_event.reply(f"❌ Login failed: {e}\n\nUse /login to try again")
-                                            await user_client.disconnect()
-                                            del self.login_states[user_id]
-                                    return
-
-                                except Exception as e:
-                                    await code_event.reply(f"❌ Login failed: {e}\n\nUse /login to try again")
-                                    await user_client.disconnect()
-                                    del self.login_states[user_id]
-                                    return
-
-                                session_string = user_client.session.save()
-                                self.db.save_session(user_id, phone, api_id, api_hash, session_string)
-                                await code_event.reply("✅ Login successful! Use /start to continue.")
-                                await user_client.disconnect()
-                                del self.login_states[user_id]
-                                self.logger.send_log(user_id, f"✅ Account added: {phone}")
-
-                        except Exception as e:
-                            await phone_event.reply(f"❌ Error: {e}\n\nUse /login to try again")
-                            if user_id in self.login_states:
-                                del self.login_states[user_id]
-
-                except ValueError:
-                    await api_event.reply("❌ Invalid API_ID. It must be a number.\n\nUse /login to try again")
-                    if user_id in self.login_states:
-                        del self.login_states[user_id]
-                except Exception as e:
-                    await api_event.reply(f"❌ Error: {e}\n\nUse /login to try again")
-                    if user_id in self.login_states:
-                        del self.login_states[user_id]
-
-        @self.bot.on(events.NewMessage(pattern='/setmessage'))
-        async def setmessage(event):
-            user_id = event.sender_id
-            if not self.db.is_premium(user_id):
-                await event.reply("❌ Premium subscription required.")
-                return
-            self.pending_message[user_id] = True
-            await event.reply("💬 Please send the promotional message you want to broadcast:")
-
-        @self.bot.on(events.NewMessage(pattern='/setdelay'))
-        async def setdelay(event):
-            user_id = event.sender_id
-            if not self.db.is_premium(user_id):
-                await event.reply("❌ Premium subscription required.")
-                return
-            self.pending_delay[user_id] = True
-            await event.reply(
-                "⏱️ **Set Delays:**\n\n"
-                "Send in format: `MESSAGE_DELAY CYCLE_DELAY`\n\n"
-                "Message Delay (seconds): 30, 45, or 60\n"
-                "Cycle Delay (minutes): 2, 5, or 10\n\n"
-                "Example: `45 5`",
-                parse_mode='md'
-            )
-
-        @self.bot.on(events.NewMessage(pattern='/startcampaign'))
-        async def startcampaign(event):
-            user_id = event.sender_id
-            if not self.db.is_premium(user_id):
-                await event.reply("❌ Premium subscription required.")
-                return
-            user = self.db.get_user(user_id)
-            if not user or not user[4]:
-                await event.reply("❌ Please login first using /login")
-                return
-            if not user[5]:
-                await event.reply("❌ Please set a message first using /setmessage")
-                return
-            if user_id in self.tasks:
-                await event.reply("⚠️ Campaign already running!")
-                return
-            self.db.set_campaign_status(user_id, 1)
-            task = asyncio.create_task(self.run_campaign(user_id))
-            self.tasks[user_id] = task
-            await event.reply("🚀 Campaign started!")
-            self.logger.send_log(user_id, "🚀 Campaign started")
-
-        @self.bot.on(events.NewMessage(pattern='/stopcampaign'))
-        async def stopcampaign(event):
-            user_id = event.sender_id
-            if not self.db.is_premium(user_id):
-                await event.reply("❌ Premium subscription required.")
-                return
-            if user_id not in self.tasks:
-                await event.reply("⚠️ No campaign running!")
-                return
-            self.db.set_campaign_status(user_id, 0)
-            self.tasks[user_id].cancel()
-            del self.tasks[user_id]
-            await event.reply("🛑 Campaign stopped!")
-            self.logger.send_log(user_id, "🛑 Campaign stopped")
-
-        # Global handler to catch setmessage and setdelay responses
         @self.bot.on(events.NewMessage())
         async def global_handler(event):
-            user_id = event.sender_id
+            uid = event.sender_id
             text = event.message.text
-            if not text or text.startswith('/'):
+            if not text: return
+
+            # Cancel
+            if text.strip() == '/cancel':
+                for d in [self.pending_message, self.pending_delay]:
+                    if uid in d: del d[uid]
+                if uid in self.login_states:
+                    try:
+                        c = self.login_states[uid].get('client')
+                        if c: await c.disconnect()
+                    except: pass
+                    del self.login_states[uid]
+                if self.db.is_premium(uid):
+                    send_msg(uid, self.dashboard_text(uid), dashboard_keyboard())
                 return
 
-            # Handle pending setmessage
-            if user_id in self.pending_message:
-                del self.pending_message[user_id]
-                self.db.set_promo_message(user_id, text)
-                await event.reply("✅ Promotional message saved!\n\nUse /startcampaign to begin.")
+            # Pending setmessage
+            if uid in self.pending_message and not text.startswith('/'):
+                del self.pending_message[uid]
+                self.db.set_promo_message(uid, text)
+                send_msg(uid, "✅ *Message saved!*\n\nReady to start campaign.",
+                    make_keyboard([
+                        [{"text": "🚀 Start Campaign", "callback_data": "startcampaign"}],
+                        [{"text": "🏠 Dashboard", "callback_data": "dashboard"}]
+                    ]))
                 return
 
-            # Handle pending setdelay
-            if user_id in self.pending_delay:
-                del self.pending_delay[user_id]
+            # Pending setdelay
+            if uid in self.pending_delay and not text.startswith('/'):
+                del self.pending_delay[uid]
                 try:
                     parts = text.split()
                     msg_delay = int(parts[0])
@@ -669,49 +542,108 @@ class PromoBot:
                     if cycle_delay not in [2, 5, 10]:
                         await event.reply("❌ Cycle delay must be 2, 5, or 10 minutes")
                         return
-                    self.db.set_delay(user_id, msg_delay)
-                    self.db.set_cycle_delay(user_id, cycle_delay * 60)
-                    await event.reply(
-                        f"✅ Delays set!\n\n"
-                        f"Message Delay: {msg_delay}s\n"
-                        f"Cycle Delay: {cycle_delay}m"
-                    )
+                    self.db.set_delay(uid, msg_delay)
+                    self.db.set_cycle_delay(uid, cycle_delay * 60)
+                    send_msg(uid,
+                        f"✅ *Delays Updated!*\n\n⏱️ Message: {msg_delay}s\n🔄 Cycle: {cycle_delay}m",
+                        back_keyboard())
                 except (ValueError, IndexError):
-                    await event.reply("❌ Invalid format. Use: MESSAGE_DELAY CYCLE_DELAY\n\nExample: 45 5")
+                    await event.reply("❌ Format: `MSG_DELAY CYCLE_DELAY`\nExample: `45 5`")
                 return
 
-        # FIX: user_id was undefined in original code
-        @self.bot.on(events.NewMessage(pattern='/status'))
-        async def status(event):
-            user_id = event.sender_id  # BUG FIX: was missing in original
-            if not self.db.is_premium(user_id):
-                await event.reply("❌ Premium subscription required.")
-                return
-            user = self.db.get_user(user_id)
-            if not user:
-                await event.reply("❌ No data found. Please use /login first.")
-                return
-            status_text = "🟢 Running" if user[6] else "🔴 Stopped"
-            phone = user[1] if user[1] else "Not set"
-            message_preview = (user[5][:50] + '...') if user[5] and len(user[5]) > 50 else (user[5] or "Not set")
-            await event.reply(
-                f"📊 **Campaign Status**\n\n"
-                f"Status: {status_text}\n"
-                f"Phone: {phone}\n"
-                f"Message: {message_preview}\n"
-                f"Delay: {user[7]}s\n"
-                f"Cycle Delay: {user[8] // 60}m",
-                parse_mode='md'
-            )
+            # Login flow
+            if uid in self.login_states:
+                await self.handle_login(event, uid, text)
 
-    async def run_campaign(self, user_id):
+    async def handle_login(self, event, uid, text):
+        if text.startswith('/'): return
+        state = self.login_states[uid]
+        step = state.get('step')
+
+        if step == 'waiting_api':
+            try:
+                parts = text.strip().split()
+                if len(parts) != 2:
+                    await event.reply("❌ Format: `API_ID API_HASH`")
+                    return
+                api_id = int(parts[0])
+                api_hash = parts[1]
+                state['api_id'] = api_id
+                state['api_hash'] = api_hash
+                state['step'] = 'waiting_phone'
+                send_msg(uid,
+                    "✅ Credentials received!\n\n📱 Send your phone number:\nExample: `+911234567890`",
+                    make_keyboard([[{"text": "❌ Cancel", "callback_data": "cancel_login"}]]))
+            except ValueError:
+                await event.reply("❌ API\\_ID must be a number")
+                del self.login_states[uid]
+
+        elif step == 'waiting_phone':
+            if not text.startswith('+'):
+                await event.reply("❌ Must start with + and country code\nExample: `+911234567890`")
+                return
+            try:
+                user_client = TelegramClient(StringSession(), state['api_id'], state['api_hash'])
+                await user_client.connect()
+                await user_client.send_code_request(text.strip())
+                state['client'] = user_client
+                state['phone'] = text.strip()
+                state['step'] = 'waiting_code'
+                send_msg(uid, "📨 *Code sent!*\n\nEnter the verification code:",
+                    make_keyboard([[{"text": "❌ Cancel", "callback_data": "cancel_login"}]]))
+            except Exception as e:
+                await event.reply(f"❌ Error: {e}")
+                del self.login_states[uid]
+
+        elif step == 'waiting_code':
+            code = text.replace('-', '').replace(' ', '')
+            if not code.isdigit():
+                await event.reply("❌ Enter only the numeric code")
+                return
+            try:
+                await state['client'].sign_in(state['phone'], code)
+                session = state['client'].session.save()
+                self.db.save_session(uid, state['phone'], state['api_id'], state['api_hash'], session)
+                await state['client'].disconnect()
+                del self.login_states[uid]
+                self.logger.send_log(uid, f"✅ Logged in: {state['phone']}")
+                send_msg(uid, "✅ *Login Successful!*\n\nYour account is connected.",
+                    make_keyboard([
+                        [{"text": "💬 Set Message", "callback_data": "setmessage"}],
+                        [{"text": "🏠 Dashboard", "callback_data": "dashboard"}]
+                    ]))
+            except SessionPasswordNeededError:
+                state['step'] = 'waiting_password'
+                send_msg(uid, "🔐 *2FA Enabled*\n\nSend your 2FA password:",
+                    make_keyboard([[{"text": "❌ Cancel", "callback_data": "cancel_login"}]]))
+            except Exception as e:
+                await event.reply(f"❌ Invalid code: {e}")
+                await state['client'].disconnect()
+                del self.login_states[uid]
+
+        elif step == 'waiting_password':
+            try:
+                await state['client'].sign_in(password=text)
+                session = state['client'].session.save()
+                self.db.save_session(uid, state['phone'], state['api_id'], state['api_hash'], session)
+                await state['client'].disconnect()
+                del self.login_states[uid]
+                self.logger.send_log(uid, f"✅ Logged in (2FA): {state['phone']}")
+                send_msg(uid, "✅ *Login Successful!*\n\nYour account is connected.",
+                    make_keyboard([
+                        [{"text": "💬 Set Message", "callback_data": "setmessage"}],
+                        [{"text": "🏠 Dashboard", "callback_data": "dashboard"}]
+                    ]))
+            except Exception as e:
+                await event.reply(f"❌ 2FA failed: {e}")
+                await state['client'].disconnect()
+                del self.login_states[uid]
+
+    async def run_campaign(self, uid):
         try:
-            user = self.db.get_user(user_id)
-            phone = user[1]
-            api_id = user[2]
-            api_hash = user[3]
+            user = self.db.get_user(uid)
+            phone, api_id, api_hash = user[1], user[2], user[3]
             session_string = user[4]
-            message = user[5]
             msg_delay = user[7]
             cycle_delay = user[8]
 
@@ -722,96 +654,68 @@ class PromoBot:
             groups = [d for d in dialogs if d.is_group]
 
             if not groups:
-                await self.bot.send_message(user_id, "❌ No groups found!")
-                self.db.set_campaign_status(user_id, 0)
+                await self.bot.send_message(uid, "❌ No groups found!")
+                self.db.set_campaign_status(uid, 0)
                 await user_client.disconnect()
                 return
 
-            await self.bot.send_message(user_id, f"✅ Found {len(groups)} groups. Starting campaign...")
+            await self.bot.send_message(uid, f"📊 Found *{len(groups)}* groups. Starting...", parse_mode='md')
 
-            while self.db.get_user(user_id)[6]:
+            while self.db.get_user(uid)[6]:
                 sent = 0
                 failed = 0
-
-                # FIX: Refresh message each round in case user updated it
-                user = self.db.get_user(user_id)
+                user = self.db.get_user(uid)
                 message = user[5]
 
                 for group in groups:
-                    if not self.db.get_user(user_id)[6]:
-                        break
+                    if not self.db.get_user(uid)[6]: break
                     try:
                         await user_client.send_message(group.entity, message)
                         sent += 1
-                        log_msg = f"[{phone}] ✓ Sent to {group.name}"
-                        self.logger.send_log(user_id, log_msg)
-                        print(log_msg)
+                        self.logger.send_log(uid, f"[{phone}] ✓ {group.name}")
                         await asyncio.sleep(msg_delay)
-
                     except FloodWaitError as e:
-                        wait_time = e.seconds
-                        await self.bot.send_message(user_id, f"⚠️ FloodWait: Waiting {wait_time}s...")
-                        await asyncio.sleep(wait_time)
-
+                        await self.bot.send_message(uid, f"⚠️ FloodWait: {e.seconds}s...")
+                        await asyncio.sleep(e.seconds)
                     except Exception as e:
                         failed += 1
-                        log_msg = f"[{phone}] ✗ Failed {group.name}: {str(e)}"
-                        self.logger.send_log(user_id, log_msg)
-                        print(log_msg)
+                        self.logger.send_log(uid, f"[{phone}] ✗ {group.name}: {e}")
                         await asyncio.sleep(10)
 
-                await self.bot.send_message(
-                    user_id,
-                    f"✅ **Round Complete!**\n\n"
-                    f"Sent: {sent}\n"
-                    f"Failed: {failed}\n\n"
-                    f"Next round in {cycle_delay // 60} minutes..."
-                )
-                print(f"User {user_id}: Round complete. Waiting {cycle_delay}s...")
+                send_msg(uid,
+                    f"✅ *Round Complete!*\n\n📤 Sent: {sent}\n❌ Failed: {failed}\n\n⏳ Next in {cycle_delay//60}m...",
+                    make_keyboard([[{"text": "🛑 Stop Campaign", "callback_data": "stopcampaign"}]]))
                 await asyncio.sleep(cycle_delay)
 
             await user_client.disconnect()
 
         except asyncio.CancelledError:
-            print(f"User {user_id}: Campaign cancelled")
+            print(f"User {uid}: Campaign cancelled")
         except Exception as e:
-            print(f"User {user_id}: Campaign error: {e}")
-            self.db.set_campaign_status(user_id, 0)
-            if user_id in self.tasks:
-                del self.tasks[user_id]
-            try:
-                await self.bot.send_message(user_id, f"❌ Campaign stopped due to error:\n{str(e)}")
-            except:
-                pass
+            print(f"User {uid}: Error: {e}")
+            self.db.set_campaign_status(uid, 0)
+            if uid in self.tasks: del self.tasks[uid]
+            try: await self.bot.send_message(uid, f"❌ Campaign error:\n{e}")
+            except: pass
 
 # ============================================
-# MAIN FUNCTION
+# MAIN
 # ============================================
 async def main():
     print("=" * 50)
     print("Premium Telegram Promotional Bot")
     print("=" * 50)
-
-    # Validate env vars
-    missing = []
-    if not os.getenv('API_ID'): missing.append('API_ID')
-    if not os.getenv('API_HASH'): missing.append('API_HASH')
-    if not os.getenv('MAIN_BOT_TOKEN'): missing.append('MAIN_BOT_TOKEN')
-    if not os.getenv('LOGGER_BOT_TOKEN'): missing.append('LOGGER_BOT_TOKEN')
-    if not os.getenv('ADMIN_IDS'): missing.append('ADMIN_IDS')
-
+    missing = [v for v in ['API_ID','API_HASH','MAIN_BOT_TOKEN','LOGGER_BOT_TOKEN','ADMIN_IDS'] if not os.getenv(v)]
     if missing:
-        print(f"❌ Missing environment variables: {', '.join(missing)}")
+        print(f"❌ Missing: {', '.join(missing)}")
         sys.exit(1)
-
-    bot = PromoBot()
-    await bot.start()
+    await PromoBot().start()
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n\nBot stopped by user")
+        print("\nBot stopped")
     except Exception as e:
-        print(f"\n\nFatal error: {e}")
+        print(f"Fatal: {e}")
         sys.exit(1)
